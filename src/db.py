@@ -3,10 +3,13 @@ import os
 import json
 from datetime import datetime
 
-DB_PATH = "chroma_db/telemetry.db"
+if os.environ.get("VERCEL") == "1":
+    DB_PATH = "/tmp/telemetry.db"
+else:
+    DB_PATH = "chroma_db/telemetry.db"
 
 def init_db():
-    if not os.path.exists("chroma_db"):
+    if not os.environ.get("VERCEL") == "1" and not os.path.exists("chroma_db"):
         os.makedirs("chroma_db", exist_ok=True)
         
     conn = sqlite3.connect(DB_PATH)

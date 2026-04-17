@@ -306,3 +306,78 @@ body {
 #upload-btn.uploading svg {
     animation: pulse 1.5s infinite;
 }
+
+#upload-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ── Upload Progress ──────────────────────────────────────────────── */
+.upload-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 1rem 1.25rem;
+    background: var(--bg-glass);
+    border: var(--border-accent);
+    border-radius: 0 12px 12px 12px;
+    min-width: 280px;
+}
+
+.upload-progress-label {
+    font-size: 0.8rem;
+    color: var(--accent);
+    font-family: monospace;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.upload-progress-bar-track {
+    height: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.upload-progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), #00bcd4);
+    border-radius: 4px;
+    transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 0 8px rgba(0, 229, 255, 0.5);
+}
+
+.upload-progress-pct {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: monospace;
+    align-self: flex-end;
+}
+
+/* ── Error / Success bubbles ──────────────────────────────────────── */
+.error-response {
+    border-color: rgba(255, 80, 80, 0.5) !important;
+    background: rgba(255, 50, 50, 0.08) !important;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    color: #ff8080;
+}
+
+.success-response {
+    border-color: rgba(0, 229, 255, 0.4) !important;
+    background: rgba(0, 229, 255, 0.08) !important;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+    #chat-container { padding: 1rem; }
+    .input-area     { padding: 1rem; }
+    .message        { max-width: 95%; }
+    .glass-header   { padding: 1rem; }
+}

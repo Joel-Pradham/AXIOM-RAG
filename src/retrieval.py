@@ -1,79 +1,96 @@
-from langchain_chroma import Chroma
-from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers import EnsembleRetriever, ContextualCompressionRetriever
-from langchain_cohere import CohereEmbeddings, CohereRerank
+"""
+retrieval.py — Hybrid dense + sparse retriever backed by the shared vectorstore.
+
+Uses src.store.get_vectorstore() so it always reads from the same FAISS index
+that ingestion.py writes to — no more disconnected instances.
+"""
+
 from typing import List
 from langchain_core.documents import Document
 
-class RAGTutorRetriever:
-    def __init__(self, persist_directory: str = "./chroma_db", all_documents: List[Document] = None):
-        import os
-        if "OPENAI_API_KEY" in os.environ:
-            try:
-                from langchain_openai import OpenAIEmbeddings
-            except ImportError:
-                pass
-            self.embeddings = OpenAIEmbeddings()
-        elif "COHERE_API_KEY" in os.environ:
-            from langchain_cohere import CohereEmbeddings
-            self.embeddings = CohereEmbeddings(model="embed-english-v3.0")
-        else:
-            try:
-                from langchain_huggingface import HuggingFaceEmbeddings
-            except ImportError:
-                from langchain_community.embeddings import HuggingFaceEmbeddings
-            self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        # 1. Base Dense Retriever — expanded to k=15 for maximum recall
-        self.vectorstore = Chroma(
-            collection_name="educational_material",
-            embedding_function=self.embeddings,
-            persist_directory=persist_directory
-        )
-        self.dense_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 15})
-        
-        # 2. Sparse (Keyword) Retriever
-        if all_documents is not None:
-            self.sparse_retriever = BM25Retriever.from_documents(all_documents)
-            self.sparse_retriever.k = 15
-        else:
-            try:
-                docs = self.vectorstore.get()
-                if docs and len(docs.get("documents", [])) > 0:
-                    documents = [Document(page_content=doc, metadata=meta) for doc, meta in zip(docs['documents'], docs['metadatas'])]
-                    self.sparse_retriever = BM25Retriever.from_documents(documents)
-                    self.sparse_retriever.k = 15
-                else:
-                    self.sparse_retriever = None
-            except Exception as e:
-                print(f"BM25 Initialization fell back: {e}")
-                self.sparse_retriever = None
 
-        # 3. No ensemble — we merge manually to prevent the EnsembleRetriever
-        #    from silently collapsing 20 → 3 results.
-        #    Cross-Encoder Reranker (only if Cohere key present)
+class RAGTutorRetriever:
+
+    def __init__(self, persist_directory: str = None, all_documents: List[Document] = None):
+        """
+        persist_directory is kept for backwards-compatibility but is now
+        ignored — the shared store manages persistence internally.
+        """
         import os
+        from src.store import get_vectorstore
+
+        self.vectorstore = get_vectorstore()
+        self.dense_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 15})
+
+        # ── Sparse (BM25) retriever — built from whatever is in the store ────
+        self.sparse_retriever = None
+        try:
+            from langchain_community.retrievers import BM25Retriever
+
+            documents = []
+            if hasattr(self.vectorstore, "docstore") and hasattr(self.vectorstore.docstore, "_dict"):
+                documents = list(self.vectorstore.docstore._dict.values())
+            elif hasattr(self.vectorstore, "store"):
+                documents = list(self.vectorstore.store.values())
+
+            if documents:
+                self.sparse_retriever = BM25Retriever.from_documents(documents)
+                self.sparse_retriever.k = 15
+        except Exception as e:
+            print(f"[retrieval] BM25 init skipped: {e}")
+
+        # ── Cohere cross-encoder reranker (optional) ─────────────────────────
+        self.compressor = None
         if "COHERE_API_KEY" in os.environ:
-            self.compressor = CohereRerank(top_n=6, model="rerank-english-v3.0")
-            self.final_retriever = ContextualCompressionRetriever(
-                base_compressor=self.compressor,
-                base_retriever=self.dense_retriever
-            )
+            try:
+                from langchain_cohere import CohereRerank
+                from langchain_classic.retrievers import ContextualCompressionRetriever
+                compressor = CohereRerank(top_n=6, model="rerank-english-v3.0")
+                self.final_retriever = ContextualCompressionRetriever(
+                    base_compressor=compressor,
+                    base_retriever=self.dense_retriever,
+                )
+            except Exception as e:
+                print(f"[retrieval] Cohere reranker unavailable: {e}")
+                self.final_retriever = None
         else:
             self.final_retriever = None
 
+    # ── Method called after a new upload to refresh BM25 ─────────────────────
+    def refresh_sparse_retriever(self):
+        """Re-build BM25 index after new documents are added to the store."""
+        try:
+            from langchain_community.retrievers import BM25Retriever
+
+            documents = []
+            if hasattr(self.vectorstore, "docstore") and hasattr(self.vectorstore.docstore, "_dict"):
+                documents = list(self.vectorstore.docstore._dict.values())
+            elif hasattr(self.vectorstore, "store"):
+                documents = list(self.vectorstore.store.values())
+
+            if documents:
+                self.sparse_retriever = BM25Retriever.from_documents(documents)
+                self.sparse_retriever.k = 15
+                print(f"[retrieval] BM25 refreshed with {len(documents)} documents.")
+        except Exception as e:
+            print(f"[retrieval] BM25 refresh failed: {e}")
+
     def retrieve(self, query: str) -> List[Document]:
         """
-        Retrieve documents using dense + sparse search, deduplicate, 
-        filter garbage chunks, and return top 8 unique results.
+        Dense + sparse hybrid retrieval with deduplication and length filtering.
+        Falls back gracefully if any component fails.
         """
-        MIN_CHUNK_LENGTH = 80  # Ignore fragments (headers, footers, page numbers)
-        MAX_RESULTS = 8
+        MIN_CHUNK_LEN = 80
+        MAX_RESULTS   = 8
 
-        # Get dense results
-        dense_docs = self.dense_retriever.invoke(query)
-        
-        # Get sparse results if available
+        # Dense
+        try:
+            dense_docs = self.dense_retriever.invoke(query)
+        except Exception as e:
+            print(f"[retrieval] Dense retrieval failed: {e}")
+            dense_docs = []
+
+        # Sparse
         sparse_docs = []
         if self.sparse_retriever:
             try:
@@ -81,20 +98,19 @@ class RAGTutorRetriever:
             except Exception:
                 sparse_docs = []
 
-        # Merge and deduplicate by content hash
-        seen = set()
-        merged = []
+        # Merge + deduplicate by content hash
+        seen, merged = set(), []
         for doc in dense_docs + sparse_docs:
-            content_hash = hash(doc.page_content.strip())
-            if content_hash not in seen and len(doc.page_content.strip()) >= MIN_CHUNK_LENGTH:
-                seen.add(content_hash)
+            h = hash(doc.page_content.strip())
+            if h not in seen and len(doc.page_content.strip()) >= MIN_CHUNK_LEN:
+                seen.add(h)
                 merged.append(doc)
 
-        # If Cohere reranker is available, use it; otherwise return top merged
+        # Rerank if Cohere available
         if self.final_retriever:
             try:
                 return self.final_retriever.invoke(query)[:MAX_RESULTS]
-            except Exception:
-                pass
-        
+            except Exception as e:
+                print(f"[retrieval] Reranker failed, using merged: {e}")
+
         return merged[:MAX_RESULTS]
