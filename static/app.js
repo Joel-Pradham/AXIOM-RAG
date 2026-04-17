@@ -51,6 +51,19 @@ document.addEventListener('DOMContentLoaded', () => {
             citationsHtml = `<div class="citations">${chips}</div>`;
         }
 
+        // Faithfulness score badge (only shown for RAG answers)
+        let faithBadge = '';
+        if (data.faithfulness_score !== null && data.faithfulness_score !== undefined) {
+            const score  = data.faithfulness_score;
+            const pct    = Math.round(score * 100);
+            const color  = score >= 0.85 ? '#00e5ff' : score >= 0.70 ? '#ffcc00' : '#ff6060';
+            faithBadge   = `
+                <div class="faith-badge" title="How closely the answer aligns with the uploaded document chunks">
+                    <svg viewBox="0 0 24 24" width="11" height="11" stroke="currentColor" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"/></svg>
+                    Document Alignment: <span style="color:${color};font-weight:600">${pct}%</span>
+                </div>`;
+        }
+
         el.innerHTML = `
             <div class="telemetry">
                 <span class="telemetry-header">
@@ -62,6 +75,7 @@ document.addEventListener('DOMContentLoaded', () => {
             <div class="ai-response">
                 ${data.answer}
             </div>
+            ${faithBadge}
             ${citationsHtml}`;
         scrollToBottom();
     };
