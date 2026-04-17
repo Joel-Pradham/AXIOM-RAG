@@ -25,16 +25,19 @@ class RAGTutorRetriever:
         self.sparse_retriever = None
         self._build_sparse()
 
-        # ── Cohere cross-encoder reranker ─────────────────────────────────────
+        # ── Cohere reranker — DISABLED on Vercel (timeout risk) ──────────────
+        # Enabled on Railway/Docker where there's no execution time limit.
         self.reranker = None
-        if "COHERE_API_KEY" in os.environ:
+        is_vercel = os.environ.get("VERCEL") == "1"
+        if "COHERE_API_KEY" in os.environ and not is_vercel:
             try:
                 from langchain_cohere import CohereRerank
-                # top_n=8 — keep more chunks for the LLM to work with
                 self.reranker = CohereRerank(top_n=8, model="rerank-english-v3.0")
                 print("[retrieval] Cohere reranker initialised (top_n=8).")
             except Exception as e:
                 print(f"[retrieval] Cohere reranker unavailable: {e}")
+        elif is_vercel:
+            print("[retrieval] Vercel detected — reranker disabled for latency.")
 
     def _build_sparse(self):
         """Build or rebuild BM25 index from current vectorstore contents."""

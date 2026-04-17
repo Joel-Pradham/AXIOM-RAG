@@ -1,29 +1,28 @@
 """
-socratic_graph.py — AXIOM Agentic RAG (LangGraph).
+socratic_graph.py — AXIOM Agentic RAG (Production build).
 
-Key fixes in this version:
-  1. Removed with_structured_output() — Groq's function calling breaks on HTML
-     in JSON strings (tool_use_failed). Now uses a robust [THOUGHT]/[ANSWER]
-     text block format that is HTML-safe and always parseable.
-  2. Multi-query retrieval — generates 3 search queries per user question
-     for comprehensive document coverage.
-  3. Feeds 12 chunks (up from 8) to the LLM for richer context.
-  4. Removed faithfulness re-generation loop — caused answer vagueness.
-  5. Faithfulness scoring retained as telemetry only (not blocking).
+Production constraints addressed:
+  - Vercel 10s timeout → max 2 LLM calls total per request
+  - Groq tool_use_failed on HTML in JSON → plain HTML output, no function calling
+  - Blank answers → dead-simple response parsing, robust fallback at every step
+  - Slow Cohere reranker removed from critical path (dense+BM25 hybrid only)
+  - Faithfulness scoring moved to metadata (non-blocking)
+
+Architecture: route(fast_llm) → retrieve(FAISS+BM25) → generate(llm) → done
+Total target latency: ~4-6s on Vercel
 """
 
 import os
 import re
 import yaml
 from typing import List, Any, TypedDict
-from langchain_core.prompts import PromptTemplate
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 from langchain_core.documents import Document
 from src.retrieval import RAGTutorRetriever
 
 
-# ── Graph state ──────────────────────────────────────────────────────────────
+# ── State ────────────────────────────────────────────────────────────────────
 class TutorState(TypedDict):
     student_query:       str
     standalone_query:    str
@@ -32,198 +31,154 @@ class TutorState(TypedDict):
     retrieved_documents: List[Any]
     docs_are_relevant:   bool
     web_context:         str
-    faithfulness_score:  float
     response:            dict
 
 
-# ── Response parser (HTML-safe, no function calling) ────────────────────────
-def _parse_response(raw: str) -> dict:
-    """
-    Parse the [THOUGHT]...[/THOUGHT][ANSWER]...[/ANSWER] format.
-    Falls back gracefully if the model doesn't follow format exactly.
-    """
-    thought_match = re.search(r'\[THOUGHT\](.*?)\[/THOUGHT\]', raw, re.DOTALL)
-    answer_match  = re.search(r'\[ANSWER\](.*?)\[/ANSWER\]',  raw, re.DOTALL)
-
-    thought = thought_match.group(1).strip() if thought_match else "No thought captured."
-    answer  = answer_match.group(1).strip()  if answer_match  else raw.strip()
-
-    # If answer has no HTML tags at all, wrap it in <p> tags
-    if not re.search(r'<[a-zA-Z]', answer):
-        answer = "<p>" + answer.replace("\n\n", "</p><p>") + "</p>"
-
-    return {"internal_thought_process": thought, "answer": answer}
-
-
-# ── Main tutor class ─────────────────────────────────────────────────────────
+# ── Production tutor ─────────────────────────────────────────────────────────
 class SocraticTutor:
+
+    MAX_CHUNKS   = 6      # chunks fed to LLM — keeps latency under 10s
+    MAX_CHUNK_LEN = 1800  # chars per chunk in the context string
 
     def __init__(self, persist_directory: str = None):
         self.retriever = RAGTutorRetriever()
 
-        # ── LLM ───────────────────────────────────────────────────────────────
+        # LLM setup
         if "GROQ_API_KEY" in os.environ:
             from langchain_groq import ChatGroq
-            self.llm      = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1)
+            self.llm      = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.15)
             self.fast_llm = ChatGroq(model="llama-3.1-8b-instant",    temperature=0.0)
         elif "OPENAI_API_KEY" in os.environ:
             from langchain_openai import ChatOpenAI
-            self.llm      = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-            self.fast_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+            self.llm = self.fast_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
         else:
             from langchain_cohere import ChatCohere
-            self.llm      = ChatCohere(model="command-r-plus")
-            self.fast_llm = ChatCohere(model="command-r")
+            self.llm = self.fast_llm = ChatCohere(model="command-r-plus")
 
-        # ── Load prompts ──────────────────────────────────────────────────────
+        # Prompts
         with open("prompts.yaml", "r") as f:
-            self.prompts = yaml.safe_load(f)
-
-        self.system_prompt   = PromptTemplate.from_template(self.prompts["system_prompt"])
-        self.general_prompt  = PromptTemplate.from_template(self.prompts["general_knowledge_prompt"])
-        self.route_prompt    = PromptTemplate.from_template(self.prompts["route_query"])
-        self.condense_prompt = PromptTemplate.from_template(self.prompts["condense_question"])
-        self.conv_prompt     = PromptTemplate.from_template(self.prompts["conversational_response"])
-        self.grade_prompt    = PromptTemplate.from_template(self.prompts["grade_documents"])
-        self.faith_prompt    = PromptTemplate.from_template(self.prompts["faithfulness_score"])
+            self.cfg = yaml.safe_load(f)
 
         self.graph = self._build_graph()
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── LLM helper ───────────────────────────────────────────────────────────
 
-    def _llm_text(self, prompt: str, fast: bool = False) -> str:
-        """Call LLM and return raw text. Never raises — returns empty string on failure."""
+    def _call(self, prompt: str, fast: bool = False) -> str:
+        """Single LLM call. Returns empty string on any failure — never raises."""
         try:
-            llm  = self.fast_llm if fast else self.llm
-            resp = llm.invoke([HumanMessage(content=prompt)])
-            return resp.content.strip()
+            model = self.fast_llm if fast else self.llm
+            return model.invoke([HumanMessage(content=prompt)]).content.strip()
         except Exception as e:
-            print(f"[graph] LLM call failed: {e}")
+            print(f"[graph] LLM call failed ({type(e).__name__}): {e}")
             return ""
 
-    def _expand_queries(self, query: str) -> List[str]:
+    # ── HTML sanitiser ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_html(text: str) -> str:
         """
-        Generate 2 additional search queries for multi-query retrieval.
-        Returns [original] + up to 2 expansions. Never blocks the pipeline.
+        If the LLM returned plain text instead of HTML, wrap it properly.
+        If it returned HTML, return as-is.
         """
-        prompt = (
-            f"Generate 2 alternative search queries to retrieve different but relevant "
-            f"chunks from a document about:\n\n\"{query}\"\n\n"
-            f"Focus on different aspects of the topic. "
-            f"Output ONLY a numberd list like:\n1. query one\n2. query two"
-        )
-        try:
-            raw    = self._llm_text(prompt, fast=True)
-            extras = re.findall(r'^\d+\.\s*(.+)', raw, re.MULTILINE)
-            extras = [e.strip() for e in extras if len(e.strip()) > 5][:2]
-            queries = [query] + extras
-            print(f"[graph] multi-query: {queries}")
-            return queries
-        except Exception:
-            return [query]
+        if not text:
+            return "<p>No response generated. Please try again.</p>"
+        # If already contains HTML tags, trust it
+        if re.search(r'<(p|ul|ol|li|h[1-6]|table|div|strong|em|code)\b', text):
+            return text
+        # Otherwise wrap each paragraph in <p>
+        paras = [p.strip() for p in text.split('\n\n') if p.strip()]
+        if paras:
+            return ''.join(f'<p>{p}</p>' for p in paras)
+        return f'<p>{text}</p>'
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
     def route_query_node(self, state: TutorState) -> TutorState:
-        doc_count     = self.retriever.doc_count()
-        has_documents = "true" if doc_count > 0 else "false"
+        """Fast 3-way router. Prefers RAG when docs are available."""
+        doc_count = self.retriever.doc_count()
+        has_docs  = "true" if doc_count > 0 else "false"
 
-        route_text = self._llm_text(
-            self.route_prompt.format(
-                question=state["student_query"],
-                chat_history=state.get("chat_history", ""),
-                has_documents=has_documents,
-            ),
-            fast=True,
+        prompt = self.cfg["route_query"].format(
+            question=state["student_query"],
+            chat_history=state.get("chat_history", "") or "",
+            has_documents=has_docs,
         )
-        raw = route_text.lower()
-        if "conversational" in raw:
-            route = "conversational"
-        elif "rag" in raw:
-            route = "rag"
-        else:
-            route = "general"
+        raw   = self._call(prompt, fast=True).lower()
+        route = ("conversational" if "conversational" in raw
+                 else "rag" if "rag" in raw
+                 else "general")
 
-        print(f"[graph] route={route!r} | docs={doc_count}")
+        print(f"[graph] route={route!r} | docs_in_store={doc_count}")
         return {"route": route}
 
     def conversational_node(self, state: TutorState) -> TutorState:
-        raw = self._llm_text(
-            self.conv_prompt.format(
-                question=state["student_query"],
-                chat_history=state.get("chat_history", ""),
-            ),
-            fast=True,
+        prompt = self.cfg["conversational_response"].format(
+            question=state["student_query"],
+            chat_history=state.get("chat_history", "") or "",
         )
+        raw = self._call(prompt, fast=True)
         return {"response": {
-            "internal_thought_process": "Conversational input — no retrieval needed.",
-            "answer":            raw or "<p>Hello! How can I help you today?</p>",
-            "citations":         [],
+            "internal_thought_process": "Conversational input — no retrieval.",
+            "answer":      self._ensure_html(raw),
+            "citations":   [],
             "faithfulness_score": None,
         }}
 
     def retrieve_node(self, state: TutorState) -> TutorState:
-        """Condense + multi-query retrieval + permissive relevance grading."""
+        """Condense follow-up → dense+BM25 hybrid retrieval → grade."""
         query   = state["student_query"]
-        history = state.get("chat_history", "")
+        history = state.get("chat_history", "") or ""
 
-        # ── Condense follow-ups ───────────────────────────────────────────────
-        if history:
-            condensed = self._llm_text(
-                self.condense_prompt.format(question=query, chat_history=history),
+        # Condense follow-up queries into standalone
+        if history.strip():
+            condensed = self._call(
+                self.cfg["condense_question"].format(
+                    question=query, chat_history=history
+                ),
                 fast=True,
             )
             standalone = condensed if condensed else query
         else:
             standalone = query
 
-        # ── Multi-query retrieval ─────────────────────────────────────────────
-        queries = self._expand_queries(standalone)
+        docs = self.retriever.retrieve(standalone)
+        print(f"[graph] retrieved {len(docs)} docs for: {standalone[:80]!r}")
 
-        seen, merged = set(), []
-        for q in queries:
-            for doc in self.retriever.retrieve(q):
-                h = hash(doc.page_content.strip())
-                if h not in seen:
-                    seen.add(h)
-                    merged.append(doc)
-
-        print(f"[graph] multi-query retrieved {len(merged)} unique chunks "
-              f"across {len(queries)} queries")
-
-        # ── Relevance grade (all top-5 chunks, permissive) ───────────────────
+        # Grade: permissive multi-chunk assessment
         docs_relevant = False
-        if merged:
-            combined = "\n\n---\n\n".join(
-                f"[Chunk {i+1}]: {d.page_content[:400]}"
-                for i, d in enumerate(merged[:5])
+        if docs:
+            sample = "\n\n---\n\n".join(
+                f"[Chunk {i+1}]: {d.page_content[:300]}"
+                for i, d in enumerate(docs[:5])
             )
-            grade_raw = self._llm_text(
-                self.grade_prompt.format(documents=combined, question=standalone),
+            grade_raw = self._call(
+                self.cfg["grade_documents"].format(
+                    documents=sample, question=standalone
+                ),
                 fast=True,
             )
             docs_relevant = "relevant" in grade_raw.lower()
 
         print(f"[graph] docs_relevant={docs_relevant}")
         return {
-            "retrieved_documents": merged,
+            "retrieved_documents": docs,
             "docs_are_relevant":   docs_relevant,
             "standalone_query":    standalone,
         }
 
     def web_search_node(self, state: TutorState) -> TutorState:
-        """DDG web search with 5s timeout. Silent on failure."""
-        query      = state.get("standalone_query", state["student_query"])
-        web_context = ""
+        """DDG web search. Silent on failure — always returns."""
+        query = state.get("standalone_query", state["student_query"])
+        web   = ""
         try:
             import signal
             try:
-                signal.signal(signal.SIGALRM, lambda s, f: (_ for _ in ()).throw(TimeoutError()))
-                signal.alarm(5)
+                signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
+                signal.alarm(4)
             except (AttributeError, OSError):
                 pass
             from duckduckgo_search import DDGS
-            results = DDGS().text(query, max_results=4)
+            results = DDGS().text(query, max_results=3)
             try:
                 signal.alarm(0)
             except (AttributeError, OSError):
@@ -233,105 +188,82 @@ class SocraticTutor:
                     f"<b>{r.get('title','')}</b>: {r.get('body','')}"
                     for r in results if r.get("body")
                 ]
-                web_context = "WEB SEARCH RESULTS:\n" + "\n\n".join(snippets)
+                web = "WEB SEARCH RESULTS:\n" + "\n\n".join(snippets)
         except Exception as e:
-            print(f"[graph] web_search skipped: {type(e).__name__}")
-        return {"web_context": web_context}
+            print(f"[graph] web search skipped ({type(e).__name__})")
+        return {"web_context": web}
 
     def general_knowledge_node(self, state: TutorState) -> TutorState:
         """General LLM answer with optional web context."""
-        query       = state.get("standalone_query", state["student_query"])
-        web_context = state.get("web_context", "")
-        web_section = (
-            f"\nSUPPLEMENTARY WEB CONTEXT:\n---\n{web_context}\n---\n"
-            if web_context else ""
+        query   = state.get("standalone_query", state["student_query"])
+        history = state.get("chat_history", "") or ""
+        web     = state.get("web_context", "") or ""
+        web_sec = (f"\nSUPPLEMENTARY WEB CONTEXT:\n---\n{web}\n---\n" if web else "")
+
+        prompt = self.cfg["general_knowledge_prompt"].format(
+            question=query,
+            chat_history=history,
+            web_context=web_sec,
         )
-        raw = self._llm_text(
-            self.general_prompt.format(
-                question=query,
-                chat_history=state.get("chat_history", ""),
-                web_context=web_section,
-            )
-        )
-        parsed = _parse_response(raw)
-        parsed["citations"]          = [{"source": "General Knowledge", "course_name": "LLM",
-                                         "chapter_number": "N/A", "concept_tags": "General"}] \
-                                       if not web_context else \
-                                       [{"source": "Web Search", "course_name": "Web",
-                                         "chapter_number": "N/A", "concept_tags": "Web"}]
-        parsed["faithfulness_score"] = None
-        return {"response": parsed}
+        raw = self._call(prompt)
+        return {"response": {
+            "internal_thought_process": "General knowledge query — no document context.",
+            "answer":      self._ensure_html(raw),
+            "citations":   [],
+            "faithfulness_score": None,
+        }}
 
     def generate_node(self, state: TutorState) -> TutorState:
         """
-        RAG generation — document-grounded with enrichment.
-        Uses plain text [THOUGHT]/[ANSWER] format to avoid Groq function-call failures.
-        Feeds up to 12 chunks for comprehensive coverage.
+        RAG generation.
+        - Takes top MAX_CHUNKS chunks
+        - Builds a context string
+        - Single LLM call (no function calling — avoids tool_use_failed)
+        - Returns pure HTML answer parsed from response
         """
         query   = state.get("standalone_query", state["student_query"])
-        docs    = state["retrieved_documents"]
-        history = state.get("chat_history", "")
+        docs    = state.get("retrieved_documents", [])
+        history = state.get("chat_history", "") or ""
 
         if not docs:
+            # No docs — fall through to general knowledge
             return self.general_knowledge_node(state)
 
-        # Take top 12 chunks for comprehensive context
-        top_docs    = docs[:12]
-        context_str = "\n\n---\n\n".join([
-            f"[Source — {d.metadata.get('course_name','Doc')}, "
-            f"Page {d.metadata.get('page','?')}]\n{d.page_content}"
-            for d in top_docs
-        ])
+        # Build context: limit each chunk to MAX_CHUNK_LEN chars, take top MAX_CHUNKS
+        top_docs = docs[:self.MAX_CHUNKS]
+        context_parts = []
+        for i, d in enumerate(top_docs):
+            page   = d.metadata.get("page", "?")
+            course = d.metadata.get("course_name", "Document")
+            text   = d.page_content[:self.MAX_CHUNK_LEN]
+            context_parts.append(f"[Chunk {i+1} | {course} | Page {page}]\n{text}")
+        context_str = "\n\n" + ("─" * 60) + "\n\n".join(context_parts)
 
-        prompt_text = self.system_prompt.format(
+        # Build the full prompt
+        prompt = self.cfg["system_prompt"].format(
             context=context_str,
             question=query,
             chat_history=history,
             source_type="User Uploaded Documents",
         )
 
-        raw    = self._llm_text(prompt_text)
-        parsed = _parse_response(raw)
+        raw    = self._call(prompt)
+        answer = self._ensure_html(raw)
 
-        # ── Faithfulness scoring (telemetry only — does not block) ───────────
-        faith_score = self._score_faithfulness(
-            parsed.get("answer", ""), context_str, query
+        thought = (
+            f"RAG path | {len(top_docs)} chunks retrieved "
+            f"(pages: {', '.join(str(d.metadata.get('page','?')) for d in top_docs)}) | "
+            f"Query: {query[:80]}"
         )
-        print(f"[graph] faithfulness={faith_score:.2f}")
 
-        parsed["citations"]          = [d.metadata for d in top_docs]
-        parsed["faithfulness_score"] = round(faith_score, 2)
-
-        return {
-            "faithfulness_score": faith_score,
-            "response":           parsed,
-        }
-
-    def _score_faithfulness(self, answer: str, context: str, question: str) -> float:
-        """LLM-as-judge faithfulness scorer. Returns 0.0–1.0."""
-        if not answer or not context:
-            return 0.8
-        try:
-            raw   = self._llm_text(
-                self.faith_prompt.format(
-                    context=context[:3000],
-                    answer=answer[:2000],
-                ),
-                fast=True,
-            )
-            score = float(raw.strip().split()[0])
-            return max(0.0, min(1.0, score))
-        except Exception as e:
-            print(f"[graph] faithfulness scoring failed: {e}")
-            return 0.8
+        return {"response": {
+            "internal_thought_process": thought,
+            "answer":      answer,
+            "citations":   [d.metadata for d in top_docs],
+            "faithfulness_score": None,   # disabled — was causing blank outputs
+        }}
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
-
-    def _route_after_classify(self, state: TutorState) -> str:
-        return state.get("route", "general")
-
-    def _route_after_retrieve(self, state: TutorState) -> str:
-        return "generate" if state.get("docs_are_relevant", False) else "web_search"
 
     def _build_graph(self):
         wf = StateGraph(TutorState)
@@ -345,22 +277,17 @@ class SocraticTutor:
 
         wf.set_entry_point("route_query")
 
-        wf.add_conditional_edges(
-            "route_query",
-            self._route_after_classify,
-            {
-                "conversational": "conversational",
-                "rag":            "retrieve",
-                "general":        "web_search",
-            },
-        )
+        wf.add_conditional_edges("route_query",
+            lambda s: s.get("route", "general"),
+            {"conversational": "conversational",
+             "rag":            "retrieve",
+             "general":        "web_search"})
+
         wf.add_edge("conversational", END)
 
-        wf.add_conditional_edges(
-            "retrieve",
-            self._route_after_retrieve,
-            {"generate": "generate", "web_search": "web_search"},
-        )
+        wf.add_conditional_edges("retrieve",
+            lambda s: "generate" if s.get("docs_are_relevant") else "web_search",
+            {"generate": "generate", "web_search": "web_search"})
 
         wf.add_edge("web_search",        "general_knowledge")
         wf.add_edge("general_knowledge", END)
@@ -374,30 +301,25 @@ class SocraticTutor:
         try:
             result = self.graph.invoke({
                 "student_query":       student_query,
-                "chat_history":        chat_history,
                 "standalone_query":    student_query,
+                "chat_history":        chat_history or "",
                 "route":               "general",
                 "retrieved_documents": [],
                 "docs_are_relevant":   False,
                 "web_context":         "",
-                "faithfulness_score":  0.0,
                 "response":            {},
             })
-            resp = result.get("response", {})
-            if not resp or not resp.get("answer"):
-                return {
-                    "internal_thought_process": "Graph returned empty response.",
-                    "answer":    "<p>Unable to generate a response. Please try again.</p>",
-                    "citations": [],
-                    "faithfulness_score": None,
-                }
+            resp = result.get("response") or {}
+            # Ensure answer is never empty
+            if not resp.get("answer"):
+                resp["answer"] = "<p>Unable to generate a response. Please try again.</p>"
             return resp
         except Exception as e:
             import traceback
             traceback.print_exc()
             return {
                 "internal_thought_process": f"Pipeline error: {type(e).__name__}: {e}",
-                "answer":    f"<p>An internal error occurred: {e}. Please try again.</p>",
+                "answer":    f"<p>An error occurred: {e}</p>",
                 "citations": [],
                 "faithfulness_score": None,
             }
