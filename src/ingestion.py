@@ -22,8 +22,8 @@ from langchain_core.documents import Document
 # ── Constants ──────────────────────────────────────────────────────────────────
 MAX_FILE_MB     = 50           # Hard cap per uploaded chunk reassembly
 MIN_CHUNK_CHARS = 80           # Discard short noise fragments
-CHUNK_SIZE      = 1200
-CHUNK_OVERLAP   = 150
+CHUNK_SIZE      = 2400   # ~half a textbook page — captures complete concepts
+CHUNK_OVERLAP   = 400    # generous overlap preserves cross-boundary context
 
 
 # ── Module-level splitter (cheap singleton) ────────────────────────────────────
