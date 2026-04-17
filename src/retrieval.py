@@ -1,129 +1,190 @@
 """
-retrieval.py — Hybrid dense + sparse retriever backed by the shared vectorstore.
+retrieval.py — AXIOM Ultimate Retrieval Engine (No Constraints).
 
-Key fix: The Cohere reranker now receives the MERGED hybrid (dense+sparse) candidates,
-not a fresh dense-only query. This ensures BM25 keyword matches are not discarded
-before reranking, significantly improving chunk alignment.
+Full pipeline — no Vercel compromises:
+  - Dense FAISS retrieval (top-20 per query)
+  - Sparse BM25 retrieval (top-20 per query)
+  - Reciprocal Rank Fusion (RRF) for principled score merging
+  - Cohere cross-encoder reranking (top-10 from merged pool)
+  - retrieve_multi() for multi-query parallel retrieval from graph
 """
 
 import os
-from typing import List
+from typing import List, Dict
 from langchain_core.documents import Document
 
 
 class RAGTutorRetriever:
 
-    def __init__(self, persist_directory: str = None, all_documents: List[Document] = None):
+    DENSE_K  = 20   # candidates per query from FAISS
+    SPARSE_K = 20   # candidates per query from BM25
+    RRF_K    = 60   # RRF constant (higher = smoother merging)
+    FINAL_N  = 10   # chunks to return after reranking
+
+    def __init__(self, persist_directory: str = None):
         from src.store import get_vectorstore
 
-        self.vectorstore    = get_vectorstore()
+        self.vectorstore     = get_vectorstore()
         self.dense_retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": 20}   # Retrieve more candidates for reranking
+            search_kwargs={"k": self.DENSE_K}
         )
-
-        # ── BM25 sparse retriever ─────────────────────────────────────────────
         self.sparse_retriever = None
         self._build_sparse()
 
-        # ── Cohere reranker — DISABLED on Vercel (timeout risk) ──────────────
-        # Enabled on Railway/Docker where there's no execution time limit.
+        # Cohere reranker — always enabled when available (no Vercel check)
         self.reranker = None
-        is_vercel = os.environ.get("VERCEL") == "1"
-        if "COHERE_API_KEY" in os.environ and not is_vercel:
+        if "COHERE_API_KEY" in os.environ:
             try:
                 from langchain_cohere import CohereRerank
-                self.reranker = CohereRerank(top_n=8, model="rerank-english-v3.0")
-                print("[retrieval] Cohere reranker initialised (top_n=8).")
+                self.reranker = CohereRerank(
+                    top_n=self.FINAL_N,
+                    model="rerank-english-v3.0",
+                )
+                print(f"[retrieval] Cohere reranker ready (top_n={self.FINAL_N}).")
             except Exception as e:
                 print(f"[retrieval] Cohere reranker unavailable: {e}")
-        elif is_vercel:
-            print("[retrieval] Vercel detected — reranker disabled for latency.")
+
+    # ── BM25 ─────────────────────────────────────────────────────────────────
 
     def _build_sparse(self):
-        """Build or rebuild BM25 index from current vectorstore contents."""
+        """Build BM25 index from all documents in the vectorstore."""
         try:
             from langchain_community.retrievers import BM25Retriever
-
-            documents = self._get_all_docs()
-            if documents:
-                self.sparse_retriever   = BM25Retriever.from_documents(documents)
-                self.sparse_retriever.k = 20
-                print(f"[retrieval] BM25 built with {len(documents)} documents.")
+            docs = self._get_all_docs()
+            if docs:
+                self.sparse_retriever   = BM25Retriever.from_documents(docs)
+                self.sparse_retriever.k = self.SPARSE_K
+                print(f"[retrieval] BM25 built — {len(docs)} docs.")
             else:
-                print("[retrieval] No documents yet — BM25 skipped.")
+                print("[retrieval] BM25 skipped — no documents yet.")
         except Exception as e:
-            print(f"[retrieval] BM25 init skipped: {e}")
+            print(f"[retrieval] BM25 init failed: {e}")
+
+    def refresh_sparse_retriever(self):
+        self._build_sparse()
 
     def _get_all_docs(self) -> List[Document]:
-        """Extract all Document objects from the FAISS docstore."""
         try:
-            if hasattr(self.vectorstore, "docstore") and \
-               hasattr(self.vectorstore.docstore, "_dict"):
-                return list(self.vectorstore.docstore._dict.values())
-            if hasattr(self.vectorstore, "store"):
-                return list(self.vectorstore.store.values())
+            vs = self.vectorstore
+            if hasattr(vs, "docstore") and hasattr(vs.docstore, "_dict"):
+                return list(vs.docstore._dict.values())
+            if hasattr(vs, "store"):
+                return list(vs.store.values())
         except Exception:
             pass
         return []
 
     def doc_count(self) -> int:
-        """Return number of docs in the vectorstore (used for routing decisions)."""
         try:
-            docs = self._get_all_docs()
-            # Subtract 1 for the bootstrap sentinel document
-            return max(0, len(docs) - 1)
+            return max(0, len(self._get_all_docs()) - 1)  # -1 for sentinel
         except Exception:
             return 0
 
-    def refresh_sparse_retriever(self):
-        """Re-build BM25 index after new documents are added."""
-        self._build_sparse()
+    # ── Core retrieval ────────────────────────────────────────────────────────
+
+    def _dense(self, query: str) -> List[Document]:
+        try:
+            return self.dense_retriever.invoke(query)
+        except Exception as e:
+            print(f"[retrieval] Dense failed: {e}")
+            return []
+
+    def _sparse(self, query: str) -> List[Document]:
+        if not self.sparse_retriever:
+            return []
+        try:
+            return self.sparse_retriever.invoke(query)
+        except Exception as e:
+            print(f"[retrieval] BM25 failed: {e}")
+            return []
+
+    # ── Reciprocal Rank Fusion ────────────────────────────────────────────────
+
+    @staticmethod
+    def _rrf_merge(ranked_lists: List[List[Document]], k: int = 60) -> List[Document]:
+        """
+        Merge multiple ranked document lists using Reciprocal Rank Fusion.
+        Score(d) = Σ 1 / (k + rank_i(d))  for each list i that contains d.
+        Higher scores = better combined ranking.
+        """
+        scores: Dict[int, float]    = {}
+        docs:   Dict[int, Document] = {}
+
+        for ranked in ranked_lists:
+            for rank, doc in enumerate(ranked, start=1):
+                doc_id = hash(doc.page_content.strip())
+                if doc_id not in scores:
+                    scores[doc_id] = 0.0
+                    docs[doc_id]   = doc
+                scores[doc_id] += 1.0 / (k + rank)
+
+        sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
+        return [docs[i] for i in sorted_ids]
+
+    # ── Single-query retrieve ─────────────────────────────────────────────────
 
     def retrieve(self, query: str) -> List[Document]:
-        """
-        Hybrid dense + sparse retrieval with Cohere reranking.
+        """Dense + BM25 with RRF merge and Cohere reranking."""
+        MIN_LEN = 80
+        dense  = self._dense(query)
+        sparse = self._sparse(query)
 
-        Fix: The reranker receives MERGED (dense+BM25) candidates — not a fresh
-        dense-only run — so BM25 keyword matches survive into the final ranked set.
-        """
-        MIN_CHUNK_LEN = 80
-
-        # ── Dense ─────────────────────────────────────────────────────────────
-        try:
-            dense_docs = self.dense_retriever.invoke(query)
-        except Exception as e:
-            print(f"[retrieval] Dense retrieval failed: {e}")
-            dense_docs = []
-
-        # ── Sparse (BM25) ─────────────────────────────────────────────────────
-        sparse_docs = []
-        if self.sparse_retriever:
-            try:
-                sparse_docs = self.sparse_retriever.invoke(query)
-            except Exception:
-                pass
-
-        # ── Merge + deduplicate ────────────────────────────────────────────────
-        # Dense results first (higher baseline relevance), then BM25 additions.
-        seen, merged = set(), []
-        for doc in dense_docs + sparse_docs:
-            h = hash(doc.page_content.strip())
-            if h not in seen and len(doc.page_content.strip()) >= MIN_CHUNK_LEN:
-                seen.add(h)
-                merged.append(doc)
+        merged = self._rrf_merge([dense, sparse])
+        merged = [d for d in merged if len(d.page_content.strip()) >= MIN_LEN]
 
         if not merged:
             return []
 
-        # ── Cohere rerank on the MERGED candidates ─────────────────────────────
         if self.reranker and len(merged) > 1:
             try:
-                # CohereRerank.compress_documents reranks any list of Documents
                 reranked = self.reranker.compress_documents(merged, query)
-                print(f"[retrieval] Reranked {len(merged)} → {len(reranked)} docs")
+                print(f"[retrieval] {len(merged)} → reranked → {len(reranked)} docs")
                 return reranked
             except Exception as e:
-                print(f"[retrieval] Reranker failed, using merged: {e}")
+                print(f"[retrieval] Reranker failed, using RRF: {e}")
 
-        # Fallback: return top-8 hybrid results
-        return merged[:8]
+        return merged[:self.FINAL_N]
+
+    # ── Multi-query retrieve (called by graph for maximum coverage) ───────────
+
+    def retrieve_multi(self, queries: List[str], original_question: str) -> List[Document]:
+        """
+        Run dense+sparse for each query variant, merge all candidates with RRF,
+        then rerank the full candidate pool against the ORIGINAL question.
+        This ensures comprehensive document coverage before the LLM generation.
+        """
+        MIN_LEN = 80
+
+        # Collect ranked lists per query
+        all_dense  = []
+        all_sparse = []
+        for q in queries:
+            all_dense.append(self._dense(q))
+            all_sparse.append(self._sparse(q))
+
+        # RRF merge across all query dense results, then all sparse results
+        dense_merged  = self._rrf_merge(all_dense)
+        sparse_merged = self._rrf_merge(all_sparse)
+        # Final RRF between the two modalities
+        candidates = self._rrf_merge([dense_merged, sparse_merged])
+        candidates = [d for d in candidates if len(d.page_content.strip()) >= MIN_LEN]
+
+        n_candidates = len(candidates)
+        print(f"[retrieval] Multi-query: {len(queries)} queries → "
+              f"{n_candidates} unique candidates")
+
+        if not candidates:
+            return []
+
+        # Rerank against ORIGINAL question (not expansions)
+        if self.reranker and n_candidates > 1:
+            try:
+                reranked = self.reranker.compress_documents(
+                    candidates, original_question
+                )
+                print(f"[retrieval] Reranked {n_candidates} → {len(reranked)} docs")
+                return reranked
+            except Exception as e:
+                print(f"[retrieval] Reranker failed, using RRF result: {e}")
+
+        return candidates[:self.FINAL_N]
