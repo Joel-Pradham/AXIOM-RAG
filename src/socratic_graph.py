@@ -76,7 +76,7 @@ class SocraticTutor:
             print("[tutor] Using Cohere: command-r-plus")
 
         # ── Prompts ──────────────────────────────────────────────────────────
-        with open("prompts.yaml", "r") as f:
+        with open("prompts.yaml", "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
         self.graph = self._build_graph()
@@ -109,19 +109,45 @@ class SocraticTutor:
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
+    # Keywords that signal the user wants info FROM the uploaded document
+    _DOC_INTENT_KEYWORDS = (
+        "document", "uploaded", "file", "pdf", "topic", "topics",
+        "chapter", "section", "content", "summarize", "summary",
+        "explain", "what is", "what are", "how does", "describe",
+        "tell me", "list", "covered", "about", "mention",
+    )
+
     def route_query_node(self, state: TutorState) -> TutorState:
         doc_count = self.retriever.doc_count()
-        has_docs  = "true" if doc_count > 0 else "false"
-        prompt    = self.cfg["route_query"].format(
+        query_lower = state["student_query"].lower()
+
+        # ── Hard override: docs exist → always try RAG first ──────────────
+        # The small fast-LLM router frequently makes wrong decisions when the
+        # chat history contains past answers (even after HTML stripping).
+        # Skipping the LLM router entirely when docs are present is safer
+        # and ensures we never land on "general" for document questions.
+        if doc_count > 0:
+            # Only route to conversational for obvious small talk
+            _SMALL_TALK = ("hello", "hi ", "hey ", "thanks", "thank you",
+                           "good morning", "good night", "who are you",
+                           "how are you", "bye", "goodbye")
+            is_small_talk = any(query_lower.startswith(t) or query_lower == t.strip()
+                                for t in _SMALL_TALK)
+            route = "conversational" if is_small_talk else "rag"
+            print(f"[graph] route={route!r} (hard override) | docs_in_store={doc_count}")
+            return {"route": route}
+
+        # ── No docs in store: fall back to LLM router ─────────────────────
+        prompt = self.cfg["route_query"].format(
             question=state["student_query"],
             chat_history=state.get("chat_history", "") or "",
-            has_documents=has_docs,
+            has_documents="false",
         )
         raw   = self._call(prompt, fast=True).lower()
         route = ("conversational" if "conversational" in raw
                  else "rag"       if "rag"            in raw
                  else "general")
-        print(f"[graph] route={route!r} | docs_in_store={doc_count}")
+        print(f"[graph] route={route!r} (llm router) | docs_in_store={doc_count}")
         return {"route": route}
 
     def conversational_node(self, state: TutorState) -> TutorState:
@@ -145,13 +171,23 @@ class SocraticTutor:
         1. Condense follow-up to standalone
         2. Generate 2 query variants (multi-query expansion)
         3. retrieve_multi() — RRF + Cohere reranking
-        4. Permissive relevance grading
+        4. Relevance grading — used as a HINT only, never discards docs that exist
         """
         query   = state["student_query"]
         history = state.get("chat_history", "") or ""
 
         # ── Step 1: condense ────────────────────────────────────────────────
-        if history.strip():
+        # Only condense if the query has genuine follow-up references
+        # (pronouns / demonstratives). Standalone queries must NOT be rewritten
+        # using history — that injects irrelevant topics from past turns.
+        import re
+        _FOLLOWUP_SIGNALS = (r"\bit\b", r"\bthis\b", r"\bthat\b", r"\bthey\b", r"\bthese\b", r"\bthose\b",
+                             r"\bthe previous\b", r"\bsame\b", r"\babove\b", r"\bmentioned\b",
+                             r"\bsaid earlier\b")
+        query_lower = query.lower()
+        has_followup = any(re.search(sig, query_lower) for sig in _FOLLOWUP_SIGNALS)
+
+        if history.strip() and has_followup:
             condensed = self._call(
                 self.cfg["condense_question"].format(
                     question=query, chat_history=history
@@ -186,24 +222,37 @@ class SocraticTutor:
         print(f"[graph] retrieve_multi returned {len(docs)} docs")
 
         # ── Step 4: relevance grading ───────────────────────────────────────
-        docs_relevant = False
+        # Determine if the user EXPLICITLY wants a document-based answer
+        query_lower = standalone.lower()
+        mentions_doc = any(k in query_lower for k in self._DOC_INTENT_KEYWORDS)
+
         if docs:
             sample = "\n\n---\n\n".join(
                 f"[Chunk {i+1}]: {d.page_content[:350]}"
                 for i, d in enumerate(docs[:5])
             )
+            # Use the smarter, slower LLM for grading to avoid false negatives
             grade = self._call(
                 self.cfg["grade_documents"].format(
                     documents=sample, question=standalone
                 ),
-                fast=True,
+                fast=False,
             )
-            docs_relevant = "relevant" in grade.lower()
+            grader_says_relevant = "relevant" in grade.lower()
+            
+            if mentions_doc:
+                docs_are_relevant = True
+                print(f"[graph] Grader: {grade.strip()!r} | User specifically mentioned doc. Forcing RAG route.")
+            else:
+                docs_are_relevant = grader_says_relevant
+                print(f"[graph] Grader: {grade.strip()!r} | relevance = {docs_are_relevant}")
+        else:
+            docs_are_relevant = False
+            print("[graph] No docs retrieved — routing to web_search fallback")
 
-        print(f"[graph] docs_relevant={docs_relevant}")
         return {
             "retrieved_documents": docs,
-            "docs_are_relevant":   docs_relevant,
+            "docs_are_relevant":   docs_are_relevant,
             "standalone_query":    standalone,
             "query_variants":      queries,
         }
@@ -212,6 +261,7 @@ class SocraticTutor:
         """DuckDuckGo fallback. Graceful on failure."""
         query = state.get("standalone_query", state["student_query"])
         web   = ""
+        tel = state.get("telemetry", "")
         try:
             from duckduckgo_search import DDGS
             results = DDGS().text(query, max_results=5)
@@ -221,10 +271,18 @@ class SocraticTutor:
                     for r in results if r.get("body")
                 ]
                 web = "WEB SEARCH RESULTS:\n" + "\n\n".join(snippets)
+                
+                if tel: tel += " | "
+                tel += f"Used fallback search API ({len(results)} results)."
+            else:
+                if tel: tel += " | "
+                tel += "Used fallback search API (0 results)."
             print(f"[graph] Web search: {len(results or [])} results")
         except Exception as e:
+            if tel: tel += " | "
+            tel += f"Fallback search API failed ({type(e).__name__})."
             print(f"[graph] Web search skipped ({type(e).__name__})")
-        return {"web_context": web}
+        return {"web_context": web, "telemetry": tel}
 
     def general_knowledge_node(self, state: TutorState) -> TutorState:
         query   = state.get("standalone_query", state["student_query"])
@@ -385,6 +443,8 @@ class SocraticTutor:
         )
         wf.add_edge("conversational", END)
 
+        # Route to generate whenever ANY docs were retrieved.
+        # Only fall back to web_search when retrieval returned nothing at all.
         wf.add_conditional_edges(
             "retrieve",
             lambda s: "generate" if s.get("docs_are_relevant") else "web_search",

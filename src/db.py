@@ -1,7 +1,16 @@
 import sqlite3
 import os
 import json
+import re
 from datetime import datetime
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace for clean LLM context."""
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'&[a-zA-Z]+;', ' ', text)  # &nbsp; etc.
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:600]  # Hard cap — no single turn bloats the context
 
 if os.environ.get("VERCEL") == "1":
     DB_PATH = "/tmp/telemetry.db"
@@ -68,13 +77,15 @@ def get_history(session_id: str, limit: int = 4) -> str:
     for q, r_str in results:
         try:
             r_dict = json.loads(r_str)
-            ans = r_dict.get("answer", "")
-        except:
-            ans = r_str
-            
+            raw_ans = r_dict.get("answer", "")
+        except Exception:
+            raw_ans = r_str
+
+        # Strip HTML so the LLM router sees clean text, not markup noise
+        clean_ans = _strip_html(raw_ans)
         history_lines.append(f"User: {q}")
-        history_lines.append(f"Tutor: {ans}")
-        
+        history_lines.append(f"Tutor: {clean_ans}")
+
     return "\n".join(history_lines)
 
 # Initialize database mapping automatically on load

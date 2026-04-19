@@ -1,7 +1,7 @@
 """
-retrieval.py — AXIOM Ultimate Retrieval Engine (No Constraints).
+retrieval.py — AXIOM Ultimate Retrieval Engine.
 
-Full pipeline — no Vercel compromises:
+Full pipeline:
   - Dense FAISS retrieval (top-20 per query)
   - Sparse BM25 retrieval (top-20 per query)
   - Reciprocal Rank Fusion (RRF) for principled score merging
@@ -12,6 +12,9 @@ Full pipeline — no Vercel compromises:
 import os
 from typing import List, Dict
 from langchain_core.documents import Document
+
+# Sentinel text injected when the vectorstore is first created (store.py)
+_SENTINEL = "Knowledge base initialised."
 
 
 class RAGTutorRetriever:
@@ -31,7 +34,7 @@ class RAGTutorRetriever:
         self.sparse_retriever = None
         self._build_sparse()
 
-        # Cohere reranker — always enabled when available (no Vercel check)
+        # Cohere reranker — enabled when key is available
         self.reranker = None
         if "COHERE_API_KEY" in os.environ:
             try:
@@ -51,12 +54,15 @@ class RAGTutorRetriever:
         try:
             from langchain_community.retrievers import BM25Retriever
             docs = self._get_all_docs()
-            if docs:
-                self.sparse_retriever   = BM25Retriever.from_documents(docs)
+            # Filter out the sentinel initialisation document
+            real_docs = [d for d in docs if d.page_content.strip() != _SENTINEL]
+            if real_docs:
+                self.sparse_retriever   = BM25Retriever.from_documents(real_docs)
                 self.sparse_retriever.k = self.SPARSE_K
-                print(f"[retrieval] BM25 built — {len(docs)} docs.")
+                print(f"[retrieval] BM25 built — {len(real_docs)} real docs.")
             else:
-                print("[retrieval] BM25 skipped — no documents yet.")
+                self.sparse_retriever = None
+                print("[retrieval] BM25 skipped — no real documents yet.")
         except Exception as e:
             print(f"[retrieval] BM25 init failed: {e}")
 
@@ -64,19 +70,48 @@ class RAGTutorRetriever:
         self._build_sparse()
 
     def _get_all_docs(self) -> List[Document]:
+        """
+        Extract all documents from the FAISS vectorstore.
+
+        LangChain FAISS stores documents in an InMemoryDocstore backed by a
+        plain dict ( docstore._dict ).  We also handle the index_to_docstore_id
+        path for robustness across LangChain versions.
+        """
         try:
             vs = self.vectorstore
-            if hasattr(vs, "docstore") and hasattr(vs.docstore, "_dict"):
-                return list(vs.docstore._dict.values())
+
+            # Primary path — InMemoryDocstore._dict (most LangChain versions)
+            if hasattr(vs, "docstore"):
+                docstore = vs.docstore
+                if hasattr(docstore, "_dict") and docstore._dict:
+                    return list(docstore._dict.values())
+
+                # Fallback: iterate via index_to_docstore_id mapping
+                if hasattr(vs, "index_to_docstore_id") and hasattr(docstore, "search"):
+                    docs = []
+                    for doc_id in vs.index_to_docstore_id.values():
+                        doc = docstore.search(doc_id)
+                        if isinstance(doc, Document):
+                            docs.append(doc)
+                    if docs:
+                        return docs
+
+            # Last resort — some InMemoryVectorStore variants expose .store
             if hasattr(vs, "store"):
                 return list(vs.store.values())
-        except Exception:
-            pass
+
+        except Exception as e:
+            print(f"[retrieval] _get_all_docs error: {e}")
+
         return []
 
     def doc_count(self) -> int:
+        """Return number of REAL (non-sentinel) documents in the store."""
         try:
-            return max(0, len(self._get_all_docs()) - 1)  # -1 for sentinel
+            all_docs  = self._get_all_docs()
+            real_docs = [d for d in all_docs
+                         if d.page_content.strip() != _SENTINEL]
+            return len(real_docs)
         except Exception:
             return 0
 
@@ -84,7 +119,9 @@ class RAGTutorRetriever:
 
     def _dense(self, query: str) -> List[Document]:
         try:
-            return self.dense_retriever.invoke(query)
+            results = self.dense_retriever.invoke(query)
+            # Strip sentinel from dense results
+            return [d for d in results if d.page_content.strip() != _SENTINEL]
         except Exception as e:
             print(f"[retrieval] Dense failed: {e}")
             return []
@@ -170,7 +207,7 @@ class RAGTutorRetriever:
         candidates = [d for d in candidates if len(d.page_content.strip()) >= MIN_LEN]
 
         n_candidates = len(candidates)
-        print(f"[retrieval] Multi-query: {len(queries)} queries → "
+        print(f"[retrieval] Multi-query: {len(queries)} queries -> "
               f"{n_candidates} unique candidates")
 
         if not candidates:
