@@ -221,10 +221,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── Chat ──────────────────────────────────────────────────────────────────
 
+    const sendBtn = document.getElementById('send-btn');
+
     chatForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const query = queryInput.value.trim();
         if (!query) return;
+
+        // Disable input to prevent double-sends
+        sendBtn.disabled = true;
+        queryInput.disabled = true;
 
         appendUserMessage(query);
         queryInput.value = '';
@@ -248,6 +254,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             showError(loaderId, `Could not reach the intelligence unit: ${err.message}`);
+        } finally {
+            sendBtn.disabled = false;
+            queryInput.disabled = false;
+            queryInput.focus();
         }
     });
 

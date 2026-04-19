@@ -18,35 +18,42 @@ else:
     DB_PATH = "chroma_db/telemetry.db"
 
 def init_db():
-    if not os.environ.get("VERCEL") == "1" and not os.path.exists("chroma_db"):
-        os.makedirs("chroma_db", exist_ok=True)
-        
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS interactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            user_query TEXT NOT NULL,
-            bot_response TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        if not os.environ.get("VERCEL") == "1" and not os.path.exists("chroma_db"):
+            os.makedirs("chroma_db", exist_ok=True)
+            
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                user_query TEXT NOT NULL,
+                bot_response TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[db] init failed: {e}")
 
 def add_interaction(session_id: str, query: str, response: dict):
     """
     Response is a dictionary typically containing `internal_thought_process` and `answer`.
+    Wrapped in try/except so DB failures never crash the chat endpoint.
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO interactions (session_id, user_query, bot_response) VALUES (?, ?, ?)",
-        (session_id, query, json.dumps(response))
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO interactions (session_id, user_query, bot_response) VALUES (?, ?, ?)",
+            (session_id, query, json.dumps(response))
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[db] Failed to save interaction: {e}")
 
 def get_history(session_id: str, limit: int = 4) -> str:
     """
@@ -71,9 +78,11 @@ def get_history(session_id: str, limit: int = 4) -> str:
     if not results:
         return ""
         
-    results.reverse()
-    
     history_lines = []
+    total_len = 0
+    MAX_HISTORY_CHARS = 4000
+    
+    # Process from newest to oldest to guarantee we keep the most recent context
     for q, r_str in results:
         try:
             r_dict = json.loads(r_str)
@@ -81,12 +90,19 @@ def get_history(session_id: str, limit: int = 4) -> str:
         except Exception:
             raw_ans = r_str
 
-        # Strip HTML so the LLM router sees clean text, not markup noise
         clean_ans = _strip_html(raw_ans)
-        history_lines.append(f"User: {q}")
-        history_lines.append(f"Tutor: {clean_ans}")
+        q_clean = q[:400] # cap enormously long user queries
+        
+        turn_str = f"User: {q_clean}\nTutor: {clean_ans}"
+        if total_len + len(turn_str) > MAX_HISTORY_CHARS and history_lines:
+            break
+            
+        history_lines.append(turn_str)
+        total_len += len(turn_str)
 
-    return "\n".join(history_lines)
+    # Reverse to chronological order (oldest -> newest)
+    history_lines.reverse()
+    return "\n\n".join(history_lines)
 
 # Initialize database mapping automatically on load
 init_db()

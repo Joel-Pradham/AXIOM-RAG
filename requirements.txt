@@ -3,8 +3,8 @@ langchain-community
 langchain-core
 langgraph
 langchain-cohere
+langchain-classic
 langchain-groq
-faiss-cpu
 rank_bm25
 pydantic
 pyyaml
@@ -14,3 +14,4 @@ python-multipart
 duckduckgo-search
 fastapi
 uvicorn
+faiss-cpu

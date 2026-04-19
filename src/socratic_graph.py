@@ -181,7 +181,8 @@ class SocraticTutor:
         # (pronouns / demonstratives). Standalone queries must NOT be rewritten
         # using history — that injects irrelevant topics from past turns.
         import re
-        _FOLLOWUP_SIGNALS = (r"\bit\b", r"\bthis\b", r"\bthat\b", r"\bthey\b", r"\bthese\b", r"\bthose\b",
+        _FOLLOWUP_SIGNALS = (r"\bit\b", r"\bits\b", r"\bthis\b", r"\bthat\b", r"\bthey\b", 
+                             r"\btheir\b", r"\btheirs\b", r"\bthese\b", r"\bthose\b",
                              r"\bthe previous\b", r"\bsame\b", r"\babove\b", r"\bmentioned\b",
                              r"\bsaid earlier\b")
         query_lower = query.lower()
@@ -261,7 +262,6 @@ class SocraticTutor:
         """DuckDuckGo fallback. Graceful on failure."""
         query = state.get("standalone_query", state["student_query"])
         web   = ""
-        tel = state.get("telemetry", "")
         try:
             from duckduckgo_search import DDGS
             results = DDGS().text(query, max_results=5)
@@ -271,18 +271,10 @@ class SocraticTutor:
                     for r in results if r.get("body")
                 ]
                 web = "WEB SEARCH RESULTS:\n" + "\n\n".join(snippets)
-                
-                if tel: tel += " | "
-                tel += f"Used fallback search API ({len(results)} results)."
-            else:
-                if tel: tel += " | "
-                tel += "Used fallback search API (0 results)."
             print(f"[graph] Web search: {len(results or [])} results")
         except Exception as e:
-            if tel: tel += " | "
-            tel += f"Fallback search API failed ({type(e).__name__})."
             print(f"[graph] Web search skipped ({type(e).__name__})")
-        return {"web_context": web, "telemetry": tel}
+        return {"web_context": web}
 
     def general_knowledge_node(self, state: TutorState) -> TutorState:
         query   = state.get("standalone_query", state["student_query"])
@@ -413,7 +405,7 @@ class SocraticTutor:
                 fast=True,
             )
             # Extract first number from response
-            match = re.search(r'\b(0\.\d+|1\.0|1)\b', raw)
+            match = re.search(r'\b(0\.\d+|1\.0|[01])\b', raw)
             if match:
                 return max(0.0, min(1.0, float(match.group(1))))
         except Exception as e:

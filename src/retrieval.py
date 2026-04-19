@@ -25,12 +25,6 @@ class RAGTutorRetriever:
     FINAL_N  = 10   # chunks to return after reranking
 
     def __init__(self, persist_directory: str = None):
-        from src.store import get_vectorstore
-
-        self.vectorstore     = get_vectorstore()
-        self.dense_retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": self.DENSE_K}
-        )
         self.sparse_retriever = None
         self._build_sparse()
 
@@ -78,7 +72,8 @@ class RAGTutorRetriever:
         path for robustness across LangChain versions.
         """
         try:
-            vs = self.vectorstore
+            from src.store import get_vectorstore
+            vs = get_vectorstore()
 
             # Primary path — InMemoryDocstore._dict (most LangChain versions)
             if hasattr(vs, "docstore"):
@@ -96,9 +91,16 @@ class RAGTutorRetriever:
                     if docs:
                         return docs
 
-            # Last resort — some InMemoryVectorStore variants expose .store
-            if hasattr(vs, "store"):
-                return list(vs.store.values())
+            # Last resort — some InMemoryVectorStore variants expose .store as a dict of dicts
+            if hasattr(vs, "store") and isinstance(vs.store, dict):
+                docs = []
+                for val in vs.store.values():
+                    if isinstance(val, dict) and "text" in val:
+                        from langchain_core.documents import Document
+                        docs.append(Document(page_content=val["text"], metadata=val.get("metadata", {})))
+                    elif hasattr(val, "page_content"):
+                        docs.append(val)
+                return docs
 
         except Exception as e:
             print(f"[retrieval] _get_all_docs error: {e}")
@@ -119,7 +121,13 @@ class RAGTutorRetriever:
 
     def _dense(self, query: str) -> List[Document]:
         try:
-            results = self.dense_retriever.invoke(query)
+            from src.store import get_vectorstore
+            vs = get_vectorstore()
+            # Cap k to actual doc count to prevent errors on small stores
+            actual_count = max(1, len(self._get_all_docs()))
+            k = min(self.DENSE_K, actual_count)
+            dense_retriever = vs.as_retriever(search_kwargs={"k": k})
+            results = dense_retriever.invoke(query)
             # Strip sentinel from dense results
             return [d for d in results if d.page_content.strip() != _SENTINEL]
         except Exception as e:
@@ -127,6 +135,9 @@ class RAGTutorRetriever:
             return []
 
     def _sparse(self, query: str) -> List[Document]:
+        # Lazy rebuild: if BM25 is None but docs exist, rebuild on the fly
+        if not self.sparse_retriever:
+            self._build_sparse()
         if not self.sparse_retriever:
             return []
         try:
@@ -144,12 +155,12 @@ class RAGTutorRetriever:
         Score(d) = Σ 1 / (k + rank_i(d))  for each list i that contains d.
         Higher scores = better combined ranking.
         """
-        scores: Dict[int, float]    = {}
-        docs:   Dict[int, Document] = {}
+        scores: Dict[str, float]    = {}
+        docs:   Dict[str, Document] = {}
 
         for ranked in ranked_lists:
             for rank, doc in enumerate(ranked, start=1):
-                doc_id = hash(doc.page_content.strip())
+                doc_id = doc.page_content.strip()
                 if doc_id not in scores:
                     scores[doc_id] = 0.0
                     docs[doc_id]   = doc

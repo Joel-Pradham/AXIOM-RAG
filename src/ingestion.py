@@ -22,8 +22,8 @@ from langchain_core.documents import Document
 # ── Constants ──────────────────────────────────────────────────────────────────
 MAX_FILE_MB     = 50           # Hard cap per uploaded chunk reassembly
 MIN_CHUNK_CHARS = 80           # Discard short noise fragments
-CHUNK_SIZE      = 2400   # ~half a textbook page — captures complete concepts
-CHUNK_OVERLAP   = 400    # generous overlap preserves cross-boundary context
+CHUNK_SIZE      = 1600   # ~1/3 of a textbook page (safe for 512 token limits)
+CHUNK_OVERLAP   = 200    # overlap preserves cross-boundary context
 
 
 # ── Module-level splitter (cheap singleton) ────────────────────────────────────
@@ -40,7 +40,7 @@ def clean_text(text: str) -> str:
     """Collapse PDF layout noise into readable prose."""
     text = re.sub(r'\s*\n\s*', ' ', text)          # newlines → spaces
     text = re.sub(r' {2,}', ' ', text)              # multiple spaces → one
-    text = re.sub(r'[^\x20-\x7E\u00A0-\u024F]', '', text)  # non-printable out
+    text = ''.join(c for c in text if c.isprintable()) # Retain all valid/printable characters
     return text.strip()
 
 

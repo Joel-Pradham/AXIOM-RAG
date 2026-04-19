@@ -1,195 +1,94 @@
-# AXIOM-RAG — Retrieval-Augmented Generation System
+---
+title: Axiom
+emoji: 🦇
+colorFrom: gray
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+---
+# 🦇 AXIOM-RAG: Advanced Agentic Retrieval Architecture
 
-AXIOM-RAG is a hybrid Retrieval-Augmented Generation (RAG) system that answers queries using both local document knowledge and external web search. It dynamically routes queries to the most relevant source and generates grounded, context-aware responses.
+> "It's not who I am underneath, but what I do that defines me."
+
+**AXIOM-RAG** is an intelligent, high-performance Retrieval-Augmented Generation (RAG) system built with a premium, dark-themed Wayne Enterprises aesthetic. It acts as an adaptive knowledge agent, instantly routing queries between heavily grounded local documents and real-time global web search.
 
 ---
 
-## Overview
+## 🚀 What It Does
 
-The system is designed to improve answer reliability by combining:
+AXIOM-RAG is a state-aware analytical engine designed for relentless fact-retrieval and direct, professional outputs.
 
-* Local document retrieval (vector + keyword search)
-* External web search (fallback when local data is insufficient)
-* LLM-based reasoning and response generation
-
-It supports document ingestion, query routing, and persistent session handling.
-
----
-
-## Features
-
-### Dynamic Query Routing
-
-* Classifies queries as:
-
-  * Document-based (local retrieval)
-  * General knowledge (web search)
-* Routes to the appropriate pipeline automatically
-
-### Hybrid Retrieval
-
-* Dense retrieval using embeddings (Cohere + FAISS)
-* Sparse retrieval using BM25
-* Combined results improve accuracy and relevance
-
-### Web Search Integration
-
-* Uses DuckDuckGo search as fallback
-* Ensures answers even when local documents lack information
-
-### Document Processing
-
-* Supports PDF, TXT, and Markdown files
-* Chunking-based ingestion for efficient retrieval
-
-### Persistent Context
-
-* Stores session history using SQLite
-* Maintains conversational continuity across queries
+- **Dynamic Query Routing:** Intelligently distinguishes between document-specific queries and general knowledge, routing to either local vector stores or DuckDuckGo web search.
+- **Hybrid Search Engine:** Combines dense retrieval (Cohere embeddings + FAISS) with sparse keyword retrieval (BM25) for unparalleled accuracy.
+- **Resilient Upload Pipeline:** Supports robust chunked uploads for large documents (PDF, TXT, MD) within strict serverless constraints.
+- **Persistent Context:** Integrates SQLite-backed telemetry to maintain conversation history and agentic state across sessions.
 
 ---
 
-## Tech Stack
+## 🛠️ Tech Stack
 
-### Core Framework
+### Intelligence Core
+- **LangGraph & LangChain:** Orchestrating the agentic state machine and RAG pipelines.
+- **Groq API:** Blistering-fast LLM inference for relevance grading and generation.
+- **Cohere:** State-of-the-art vector embeddings.
 
-* LangChain (RAG pipeline construction)
-* LangGraph (stateful agent workflows)
+### Search & Memory
+- **FAISS (CPU):** Lightning-fast dense vector similarity search.
+- **Rank-BM25:** Precise sparse keyword matching.
+- **DuckDuckGo Search:** Automated fallback mechanism for external intelligence.
+- **SQLite:** Lightweight, rock-solid session and telemetry tracking.
 
-### LLM & Embeddings
-
-* Groq API (fast inference)
-* Cohere (text embeddings)
-
-### Retrieval & Search
-
-* FAISS (vector similarity search)
-* BM25 (keyword-based retrieval)
-* DuckDuckGo Search (external data source)
-
-### Backend
-
-* FastAPI (Python API framework)
-* Uvicorn (ASGI server)
-
-### Storage
-
-* SQLite (session and context storage)
-
-### Frontend
-
-* HTML, CSS, JavaScript (lightweight UI)
+### Backend Infrastructure
+- **FastAPI & Uvicorn:** High-concurrency Python ASGI server capable of handling chunked streaming uploads.
+- **HTML/CSS/JS (Vanilla):** A sleek, glassmorphism-inspired dark mode frontend with dynamic transitions.
 
 ---
 
-## System Workflow
+## ⚙️ How to Run
 
-1. User submits query
-2. Query router determines intent:
+Deploying AXIOM-RAG requires minimal configuration, designed to run flawlessly on local environments or serverless platforms like Hugging Face Spaces.
 
-   * Local document query → retrieval pipeline
-   * General query → web search pipeline
-3. Retrieval layer:
+### 1. Configure the Environment
+Ensure you have your API keys ready. Create a `.env` file in the root directory:
 
-   * Dense (FAISS) + Sparse (BM25)
-4. Context is passed to LLM
-5. LLM generates final response
-6. Session is stored for continuity
-
----
-
-## Installation
-
-### Prerequisites
-
-* Python 3.9+
-* API keys (Groq, Cohere)
-
----
-
-### Clone the repository
-
-```bash id="r2x1hf"
-git clone https://github.com/your-username/axiom-rag.git
-cd axiom-rag
+```env
+GROQ_API_KEY="your_groq_api_key"
+COHERE_API_KEY="your_cohere_api_key"
 ```
+*(Optionally include `OPENAI_API_KEY` if utilizing alternative models).*
 
----
+### 2. Initialize the Environment
+Open a terminal in the project root and set up your virtual Python environment:
 
-### Setup environment
-
-```bash id="8l1m2o"
-python -m venv .venv
-
+```bash
 # Windows
+python -m venv .venv
 .venv\Scripts\activate
 
 # Mac/Linux
+python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
----
+### 3. Launch the System
+Spin up the backend API and serve the static frontend:
 
-### Environment variables
-
-Create a `.env` file:
-
-```env id="3k9fsl"
-GROQ_API_KEY=your_key_here
-COHERE_API_KEY=your_key_here
-```
-
----
-
-### Run the application
-
-```bash id="z6k1qa"
+```bash
 uvicorn src.main:app --reload
 ```
 
-Access:
-
-```id="t1p9wd"
-http://127.0.0.1:8000
-```
-
----
-
-## Project Structure
-
-```id="u6lm2n"
-axiom-rag/
-├── src/
-│   ├── main.py
-│   ├── routes/
-│   ├── retrieval/
-│   ├── agents/
-│   └── utils/
-├── data/
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Future Improvements
-
-* Improve query classification accuracy
-* Add re-ranking layer for retrieval results
-* Support multi-document reasoning
-* Deploy scalable version with vector DB (e.g., ChromaDB)
+*The AXIOM terminal will be live at `http://127.0.0.1:8000`. Access the interface to begin querying the intelligence stream.*
 
 ---
 
 ## Author
 
-Joel Pradham
+**Joel Pradham**  
 AI/ML Engineer | Backend Developer
 
 ---
 
-## License
-
-MIT License
+*Designed and Engineered to achieve the stated outcome. No compromises.*
