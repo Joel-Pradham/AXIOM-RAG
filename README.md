@@ -10,7 +10,7 @@ AXIOM-RAG: Advanced Agentic Retrieval Architecture
 
 > "It's not who I am underneath, but what I do that defines me."
 
-**AXIOM-RAG** is an intelligent, high-performance Retrieval-Augmented Generation (RAG) system built with a premium, dark-themed Wayne Enterprises aesthetic. It acts as an adaptive knowledge agent, instantly routing queries between heavily grounded local documents and real-time global web search.
+**AXIOM-RAG** is an intelligent, high-performance Retrieval-Augmented Generation (RAG) system built with a premium,It acts as an adaptive knowledge agent, instantly routing queries between heavily grounded local documents and real-time global web search.
 
 ---
 
