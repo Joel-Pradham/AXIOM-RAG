@@ -1,6 +1,5 @@
 ---
-title: Axiom
-emoji: 
+title: Axiom 
 colorFrom: gray
 colorTo: blue
 sdk: docker
