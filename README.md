@@ -1,13 +1,13 @@
 ---
 title: Axiom
-emoji: 🦇
+emoji: 
 colorFrom: gray
 colorTo: blue
 sdk: docker
 app_port: 7860
 pinned: false
 ---
-# 🦇 AXIOM-RAG: Advanced Agentic Retrieval Architecture
+AXIOM-RAG: Advanced Agentic Retrieval Architecture
 
 > "It's not who I am underneath, but what I do that defines me."
 
@@ -15,9 +15,9 @@ pinned: false
 
 ---
 
-## 🚀 What It Does
+What It Does
 
-AXIOM-RAG is a state-aware analytical engine designed for relentless fact-retrieval and direct, professional outputs.
+### AXIOM-RAG is a state-aware analytical engine designed for relentless fact-retrieval and direct, professional outputs.
 
 - **Dynamic Query Routing:** Intelligently distinguishes between document-specific queries and general knowledge, routing to either local vector stores or DuckDuckGo web search.
 - **Hybrid Search Engine:** Combines dense retrieval (Cohere embeddings + FAISS) with sparse keyword retrieval (BM25) for unparalleled accuracy.
@@ -26,14 +26,14 @@ AXIOM-RAG is a state-aware analytical engine designed for relentless fact-retrie
 
 ---
 
-## 🛠️ Tech Stack
+### Tech Stack
 
 ### Intelligence Core
 - **LangGraph & LangChain:** Orchestrating the agentic state machine and RAG pipelines.
 - **Groq API:** Blistering-fast LLM inference for relevance grading and generation.
 - **Cohere:** State-of-the-art vector embeddings.
 
-### Search & Memory
+###Search & Memory
 - **FAISS (CPU):** Lightning-fast dense vector similarity search.
 - **Rank-BM25:** Precise sparse keyword matching.
 - **DuckDuckGo Search:** Automated fallback mechanism for external intelligence.
@@ -45,7 +45,7 @@ AXIOM-RAG is a state-aware analytical engine designed for relentless fact-retrie
 
 ---
 
-## ⚙️ How to Run
+## How to Run
 
 Deploying AXIOM-RAG requires minimal configuration, designed to run flawlessly on local environments or serverless platforms like Hugging Face Spaces.
 
